@@ -1,26 +1,42 @@
-from flask import Flask
-from flask_restplus import Api, Resource, reqparse
-from flask_jwt_extended import jwt_optional, get_jwt_identity, create_access_token
+from flask import Flask, jsonify
+from flask_restx import Api, Resource, reqparse
 
 from qwc_services_core.api import CaseInsensitiveArgument
-from qwc_services_core.jwt import jwt_manager
+from qwc_services_core.app import app_nocache
+from qwc_services_core.auth import auth_manager, optional_auth, get_auth_user
+from qwc_services_core.tenant_handler import TenantHandler
 from legend_service import LegendService
 
 
 # Flask application
 app = Flask(__name__)
-api = Api(app, version='1.0', title='GetLegend API',
-          description='API for QWC GetLegend service',
+app_nocache(app)
+api = Api(app, version='1.0', title='Legend service API',
+          description="""API for QWC Legend service.
+
+The legend service delivers layer legends using an API based on
+WMS GetLegendGraphic.
+          """,
           default_label='Legend operations', doc='/api/')
 
 # disable verbose 404 error message
 app.config['ERROR_404_HELP'] = False
 
-# Setup the Flask-JWT-Extended extension
-jwt = jwt_manager(app)
+auth = auth_manager(app, api)
 
-# create Legend service
-legend_service = LegendService(app.logger)
+# create tenant handler
+tenant_handler = TenantHandler(app.logger)
+
+
+def legend_service_handler():
+    """Get or create a LegendService instance for a tenant."""
+    tenant = tenant_handler.tenant()
+    handler = tenant_handler.handler('legend', 'legend', tenant)
+    if handler is None:
+        handler = tenant_handler.register_handler(
+            'legend', tenant, LegendService(tenant, app.logger))
+    return handler
+
 
 # request parser
 legend_parser = reqparse.RequestParser(argument_class=CaseInsensitiveArgument)
@@ -31,6 +47,7 @@ legend_parser.add_argument('crs')
 legend_parser.add_argument('scale')
 legend_parser.add_argument('width')
 legend_parser.add_argument('height')
+legend_parser.add_argument('dpi')
 legend_parser.add_argument('boxspace')
 legend_parser.add_argument('layerspace')
 legend_parser.add_argument('layertitlespace')
@@ -50,13 +67,13 @@ legend_parser.add_argument('layerfontcolor')
 legend_parser.add_argument('itemfontcolor')
 legend_parser.add_argument('layertitle')
 legend_parser.add_argument('rulelabel')
+legend_parser.add_argument('transparent')
 legend_parser.add_argument('type')
 
 
-
 # routes
-@api.route('/<mapid>')
-@api.param('mapid', 'The WMS service map name')
+@api.route('/<path:service_name>')
+@api.param('service_name', 'Service name corresponding to WMS, e.g. `qwc_demo`')
 class Legend(Resource):
     @api.doc('legend')
     @api.param('layer', 'The layer name')
@@ -66,6 +83,7 @@ class Legend(Resource):
     @api.param('scale', 'The scale to consider for generating the legend')
     @api.param('width', 'The map width')
     @api.param('height', 'The map height')
+    @api.param('dpi', 'DPI')
     @api.param('boxspace', 'Space between legend frame and content (mm)')
     @api.param('layerspace', 'Vertical space between layers (mm)')
     @api.param('layertitlespace', 'Vertical space between layer title and items following (mm)')
@@ -85,10 +103,11 @@ class Legend(Resource):
     @api.param('itemfontcolor', 'Font color for layer item text')
     @api.param('layertitle', 'Whether to display layer title text')
     @api.param('rulelabel', 'Whether to display layer item text')
+    @api.param('transparent', 'Whether to set background transparency')
     @api.param('type', 'The legend image type, either "thumbnail", or "default". Defaults to "default".')
     @api.expect(legend_parser)
-    @jwt_optional
-    def get(self, mapid):
+    @optional_auth
+    def get(self, service_name):
         """Get legend graphic
 
         Return legend graphic for specified layer
@@ -103,6 +122,7 @@ class Legend(Resource):
             "scale": args['scale'] or '',
             "width": args['width'] or '',
             "height": args['height'] or '',
+            "dpi": args['dpi'] or '',
             "boxspace": args['boxspace'] or '',
             "layerspace": args['layerspace'] or '',
             "layertitlespace": args['layertitlespace'] or '',
@@ -121,15 +141,29 @@ class Legend(Resource):
             "layerfontcolor": args['layerfontcolor'] or '',
             "itemfontcolor": args['itemfontcolor'] or '',
             "layertitle": args['layertitle'] or '',
+            "transparent": args['transparent'] or '',
             "rulelabel": args['rulelabel'] or ''
         }
         # Filter empty params
         params = {k: v for k, v in params.items() if v}
 
-        access_token = create_access_token(get_jwt_identity())
+        legend_service = legend_service_handler()
         return legend_service.get_legend(
-            mapid, layer_param, format_param, params, type, access_token
+            service_name, layer_param, format_param, params, type,
+            get_auth_user()
         )
+
+
+""" readyness probe endpoint """
+@app.route("/ready", methods=['GET'])
+def ready():
+    return jsonify({"status": "OK"})
+
+
+""" liveness probe endpoint """
+@app.route("/healthz", methods=['GET'])
+def healthz():
+    return jsonify({"status": "OK"})
 
 
 # local webserver
